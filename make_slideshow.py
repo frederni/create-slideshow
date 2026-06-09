@@ -12,12 +12,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".PNG", ".HEIC", ".heic"}
-VIDEO_EXTS = {".mp4", ".MP4"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic"}
+VIDEO_EXTS = {".mp4"}
 FILENAME_DATE_RE = re.compile(r"(\d{4})[-_](\d{2})[-_](\d{2})")
 HTTP_TOO_MANY_REQUESTS = 429
 
@@ -30,13 +30,13 @@ class MediaFile:  # pylint: disable=too-many-instance-attributes
 
     path: Path
     kind: str  # "image" or "video"
+    display_path: str
     date: datetime | None = None
     lat: float | None = None
     lon: float | None = None
     rotation: int = 0
     duration: float | None = None
-    location: str | None = None
-    display_path: str = ""
+    location: str | None = field(default=None, compare=False)
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,7 +56,7 @@ def scan_files(album_dir: Path) -> list[Path]:
     """Return sorted list of image and video files in album_dir."""
     return [
         p for p in sorted(album_dir.iterdir())
-        if p.suffix in IMAGE_EXTS or p.suffix in VIDEO_EXTS
+        if p.suffix.lower() in IMAGE_EXTS or p.suffix.lower() in VIDEO_EXTS
     ]
 
 
@@ -100,11 +100,19 @@ def date_from_filename(path: Path) -> datetime | None:
         return None
 
 
+def _resolve_display_path(path: Path, output_dir: Path) -> str:
+    """Return path relative to output_dir's parent, or absolute if outside."""
+    try:
+        return str(path.relative_to(output_dir.parent))
+    except ValueError:
+        return str(path)
+
+
 def build_media_files(paths: list[Path], exif_data: dict, output_dir: Path) -> list[MediaFile]:
     """Build MediaFile objects from paths, enriched with EXIF metadata."""
     media = []
     for p in paths:
-        kind = "video" if p.suffix in VIDEO_EXTS else "image"
+        kind = "video" if p.suffix.lower() in VIDEO_EXTS else "image"
         exif = exif_data.get(str(p), {})
 
         date = (
@@ -135,37 +143,29 @@ def build_media_files(paths: list[Path], exif_data: dict, output_dir: Path) -> l
             with contextlib.suppress(TypeError, ValueError):
                 duration = float(raw_dur)
 
-        try:
-            display_path = str(p.relative_to(output_dir.parent))
-        except ValueError:
-            display_path = str(p)
-
         media.append(MediaFile(
             path=p,
             kind=kind,
+            display_path=_resolve_display_path(p, output_dir),
             date=date,
             lat=lat,
             lon=lon,
             rotation=rotation,
             duration=duration,
-            display_path=display_path,
         ))
     return media
 
 
 def convert_heic_files(media_files: list[MediaFile], converted_dir: Path, *, force: bool) -> None:
-    """Convert HEIC files to JPEG using sips, updating display_path in place."""
-    heic_files = [m for m in media_files if m.path.suffix.upper() == ".HEIC"]
+    """Convert HEIC files to JPEG using sips, returning updated MediaFile list."""
+    heic_files = [m for m in media_files if m.path.suffix.lower() == ".heic"]
     if not heic_files:
         return
     converted_dir.mkdir(exist_ok=True)
     for i, m in enumerate(heic_files, 1):
         target = converted_dir / (m.path.stem + ".jpg")
         if not force and target.exists():
-            try:
-                m.display_path = str(target.relative_to(converted_dir.parent.parent))
-            except ValueError:
-                m.display_path = str(target)
+            m.display_path = _resolve_display_path(target, converted_dir.parent.parent / "x")
             continue
         log.info("Converting HEIC [%d/%d]: %s", i, len(heic_files), m.path.name)
         result = subprocess.run(
@@ -176,10 +176,17 @@ def convert_heic_files(media_files: list[MediaFile], converted_dir: Path, *, for
         if result.returncode != 0:
             log.warning("sips failed for %s, keeping original path", m.path.name)
             continue
-        try:
-            m.display_path = str(target.relative_to(converted_dir.parent.parent))
-        except ValueError:
-            m.display_path = str(target)
+        m.display_path = _resolve_display_path(target, converted_dir.parent.parent / "x")
+
+
+def _fetch_url(req: urllib.request.Request) -> dict | None:
+    """Fetch a URL and return parsed JSON, or None on failure."""
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError) as e:
+        log.warning("geocode request failed: %s", e)
+        return None
 
 
 def geocode_one(lat: float, lon: float) -> str:
@@ -193,16 +200,12 @@ def geocode_one(lat: float, lon: float) -> str:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        if e.code == HTTP_TOO_MANY_REQUESTS:
-            time.sleep(5)
-            try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read().decode())
-            except (urllib.error.URLError, OSError) as e2:
-                log.warning("geocode request failed: %s", e2)
-                return ""
-        else:
+        if e.code != HTTP_TOO_MANY_REQUESTS:
             log.warning("geocode request failed: %s", e)
+            return ""
+        time.sleep(5)
+        data = _fetch_url(req)
+        if data is None:
             return ""
     except (urllib.error.URLError, OSError) as e:
         log.warning("geocode request failed: %s", e)
@@ -402,7 +405,6 @@ function showSlide(i) {
   clearTimeout(timer);
   if (progressAnim) { progressAnim.cancel(); progressAnim = null; }
 
-  // Build media element
   let el;
   if (s.kind === 'video') {
     el = document.createElement('video');
@@ -436,13 +438,11 @@ function showSlide(i) {
 
   wrap.replaceChildren(el);
 
-  // Caption
   let html = '';
   if (s.date) html += `<div>${s.date}</div>`;
   if (s.location) html += `<div class="loc">${s.location}</div>`;
   caption.innerHTML = html;
 
-  // Counter
   counter.textContent = `${idx + 1} / ${SLIDES.length}`;
 }
 
@@ -471,7 +471,7 @@ function togglePause() {
     if (vid) vid.pause();
   } else {
     if (vid) { vid.play(); }
-    else showSlide(idx); // restart timer for image
+    else showSlide(idx);
   }
 }
 
@@ -559,8 +559,8 @@ def main() -> None:
     log.info(
         "Found %d files (%d images, %d videos)",
         len(paths),
-        sum(1 for p in paths if p.suffix in IMAGE_EXTS),
-        sum(1 for p in paths if p.suffix in VIDEO_EXTS),
+        sum(1 for p in paths if p.suffix.lower() in IMAGE_EXTS),
+        sum(1 for p in paths if p.suffix.lower() in VIDEO_EXTS),
     )
 
     log.info("Extracting EXIF data...")
