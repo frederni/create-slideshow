@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.claude/settings.local.json
+
+# Generated output
+slideshow.html
+slideshow_data.js
+slideshow_package/
+slideshow_package.zip
+
+# Personal data
+geocache.json
+album/
+converted/
+
+# macOS
+.DS_Store
