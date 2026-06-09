@@ -1,4 +1,4 @@
-# Wedding Slideshow Generator
+# make_slideshow
 
 Generates a self-contained HTML slideshow from a directory of photos and videos. Reads EXIF metadata for dates and GPS coordinates, reverse-geocodes locations, and converts HEIC files automatically.
 
@@ -30,8 +30,8 @@ Open `slideshow.html` in a browser (must be served from the same directory as `s
 
 ## Supported formats
 
-Images: `.jpg`, `.jpeg`, `.JPG`, `.JPEG`, `.png`, `.PNG`, `.HEIC`, `.heic`
-Videos: `.mp4`, `.MP4`
+Images: `.jpg`, `.jpeg`, `.png`, `.heic` (case-insensitive)
+Videos: `.mp4` (case-insensitive)
 
 ## Notes
 

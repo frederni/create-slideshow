@@ -195,7 +195,7 @@ def geocode_one(lat: float, lon: float) -> str:
         f"https://nominatim.openstreetmap.org/reverse"
         f"?format=json&lat={lat}&lon={lon}&zoom=10"
     )
-    req = urllib.request.Request(url, headers={"User-Agent": "wedding-slideshow/1.0 (personal use)"})
+    req = urllib.request.Request(url, headers={"User-Agent": "make-slideshow/1.0 (personal use)"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
