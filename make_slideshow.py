@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
+"""Generate a browser-based slideshow HTML from a directory of photos and videos."""
+
 import argparse
+import contextlib
 import json
+import logging
 import random
 import re
 import subprocess
@@ -15,6 +19,9 @@ from pathlib import Path
 IMAGE_EXTS = {".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".PNG", ".HEIC", ".heic"}
 VIDEO_EXTS = {".mp4", ".MP4"}
 FILENAME_DATE_RE = re.compile(r"(\d{4})[-_](\d{2})[-_](\d{2})")
+HTTP_TOO_MANY_REQUESTS = 429
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -32,7 +39,8 @@ class MediaFile:  # pylint: disable=too-many-instance-attributes
     display_path: str = ""
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
     p = argparse.ArgumentParser(description="Generate a slideshow HTML from a photo/video album.")
     p.add_argument("--album-dir", type=Path, default=Path("album"))
     p.add_argument("--output", type=Path, default=Path("slideshow.html"))
@@ -45,14 +53,15 @@ def parse_args():
 
 
 def scan_files(album_dir: Path) -> list[Path]:
-    files = []
-    for p in sorted(album_dir.iterdir()):
-        if p.suffix in IMAGE_EXTS or p.suffix in VIDEO_EXTS:
-            files.append(p)
-    return files
+    """Return sorted list of image and video files in album_dir."""
+    return [
+        p for p in sorted(album_dir.iterdir())
+        if p.suffix in IMAGE_EXTS or p.suffix in VIDEO_EXTS
+    ]
 
 
 def extract_exif(paths: list[Path]) -> dict[str, dict]:
+    """Run exiftool on paths and return a dict keyed by source file path."""
     cmd = [
         "exiftool", "-json", "-n",
         "-DateTimeOriginal", "-CreateDate",
@@ -61,16 +70,17 @@ def extract_exif(paths: list[Path]) -> dict[str, dict]:
     ] + [str(p) for p in paths]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
-        print(f"Warning: exiftool exited {result.returncode}: {result.stderr[:200]}", file=sys.stderr)
+        log.warning("exiftool exited %d: %s", result.returncode, result.stderr[:200])
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
-        print("Warning: could not parse exiftool JSON output", file=sys.stderr)
+        log.warning("could not parse exiftool JSON output")
         return {}
     return {item["SourceFile"]: item for item in data}
 
 
 def parse_datetime(s: str | None) -> datetime | None:
+    """Parse an EXIF datetime string into a datetime object."""
     if not s:
         return None
     try:
@@ -80,6 +90,7 @@ def parse_datetime(s: str | None) -> datetime | None:
 
 
 def date_from_filename(path: Path) -> datetime | None:
+    """Extract a date from a filename matching YYYY-MM-DD or YYYY_MM_DD."""
     m = FILENAME_DATE_RE.search(path.name)
     if not m:
         return None
@@ -90,6 +101,7 @@ def date_from_filename(path: Path) -> datetime | None:
 
 
 def build_media_files(paths: list[Path], exif_data: dict, output_dir: Path) -> list[MediaFile]:
+    """Build MediaFile objects from paths, enriched with EXIF metadata."""
     media = []
     for p in paths:
         kind = "video" if p.suffix in VIDEO_EXTS else "image"
@@ -114,18 +126,14 @@ def build_media_files(paths: list[Path], exif_data: dict, output_dir: Path) -> l
         rotation = 0
         raw_rot = exif.get("Rotation")
         if raw_rot is not None:
-            try:
+            with contextlib.suppress(TypeError, ValueError):
                 rotation = int(float(raw_rot))
-            except (TypeError, ValueError):
-                pass
 
         duration = None
         raw_dur = exif.get("Duration")
         if raw_dur is not None:
-            try:
+            with contextlib.suppress(TypeError, ValueError):
                 duration = float(raw_dur)
-            except (TypeError, ValueError):
-                pass
 
         try:
             display_path = str(p.relative_to(output_dir.parent))
@@ -145,7 +153,8 @@ def build_media_files(paths: list[Path], exif_data: dict, output_dir: Path) -> l
     return media
 
 
-def convert_heic_files(media_files: list[MediaFile], converted_dir: Path, force: bool) -> None:
+def convert_heic_files(media_files: list[MediaFile], converted_dir: Path, *, force: bool) -> None:
+    """Convert HEIC files to JPEG using sips, updating display_path in place."""
     heic_files = [m for m in media_files if m.path.suffix.upper() == ".HEIC"]
     if not heic_files:
         return
@@ -153,20 +162,19 @@ def convert_heic_files(media_files: list[MediaFile], converted_dir: Path, force:
     for i, m in enumerate(heic_files, 1):
         target = converted_dir / (m.path.stem + ".jpg")
         if not force and target.exists():
-            # Update display_path even if already converted
             try:
                 m.display_path = str(target.relative_to(converted_dir.parent.parent))
             except ValueError:
                 m.display_path = str(target)
             continue
-        print(f"Converting HEIC [{i}/{len(heic_files)}]: {m.path.name}")
+        log.info("Converting HEIC [%d/%d]: %s", i, len(heic_files), m.path.name)
         result = subprocess.run(
             ["sips", "-s", "format", "jpeg", str(m.path), "--out", str(target)],
             capture_output=True,
             check=False,
         )
         if result.returncode != 0:
-            print(f"  Warning: sips failed for {m.path.name}, keeping original path", file=sys.stderr)
+            log.warning("sips failed for %s, keeping original path", m.path.name)
             continue
         try:
             m.display_path = str(target.relative_to(converted_dir.parent.parent))
@@ -175,6 +183,7 @@ def convert_heic_files(media_files: list[MediaFile], converted_dir: Path, force:
 
 
 def geocode_one(lat: float, lon: float) -> str:
+    """Reverse-geocode a coordinate pair to a human-readable location string."""
     url = (
         f"https://nominatim.openstreetmap.org/reverse"
         f"?format=json&lat={lat}&lon={lon}&zoom=10"
@@ -184,19 +193,19 @@ def geocode_one(lat: float, lon: float) -> str:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        if e.code == 429:
+        if e.code == HTTP_TOO_MANY_REQUESTS:
             time.sleep(5)
             try:
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode())
             except (urllib.error.URLError, OSError) as e2:
-                print(f"  Warning: geocode request failed: {e2}", file=sys.stderr)
+                log.warning("geocode request failed: %s", e2)
                 return ""
         else:
-            print(f"  Warning: geocode request failed: {e}", file=sys.stderr)
+            log.warning("geocode request failed: %s", e)
             return ""
     except (urllib.error.URLError, OSError) as e:
-        print(f"  Warning: geocode request failed: {e}", file=sys.stderr)
+        log.warning("geocode request failed: %s", e)
         return ""
 
     addr = data.get("address", {})
@@ -214,41 +223,37 @@ def geocode_one(lat: float, lon: float) -> str:
     return city or country
 
 
-def geocode_all(media_files: list[MediaFile], geocache_file: Path, skip: bool) -> None:
-    # Load existing cache
+def geocode_all(media_files: list[MediaFile], geocache_file: Path, *, skip: bool) -> None:
+    """Reverse-geocode all media files with GPS coords, using and updating a local cache."""
     cache: dict[str, str] = {}
-    if geocache_file.exists():
-        try:
+    with contextlib.suppress(json.JSONDecodeError, OSError):
+        if geocache_file.exists():
             cache = json.loads(geocache_file.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
 
     if not skip:
-        # Collect unique coords (rounded to ~1km)
-        coords_needed = set()
-        for m in media_files:
-            if m.lat is not None and m.lon is not None:
-                key = f"{round(m.lat, 2)},{round(m.lon, 2)}"
-                if key not in cache:
-                    coords_needed.add(key)
+        coords_needed = {
+            f"{round(m.lat, 2)},{round(m.lon, 2)}"
+            for m in media_files
+            if m.lat is not None and m.lon is not None
+            if f"{round(m.lat, 2)},{round(m.lon, 2)}" not in cache
+        }
 
         total = len(coords_needed)
         if total:
-            print(f"Geocoding {total} unique locations (may take ~{total * 1.1:.0f}s)...")
+            log.info("Geocoding %d unique locations (may take ~%.0fs)...", total, total * 1.1)
             for i, key in enumerate(sorted(coords_needed), 1):
                 lat_s, lon_s = key.split(",")
                 result = geocode_one(float(lat_s), float(lon_s))
                 cache[key] = result
-                print(f"  [{i}/{total}] {key} → {result or '(not found)'}")
+                log.info("  [%d/%d] %s -> %s", i, total, key, result or "(not found)")
                 if i < total:
                     time.sleep(1.1)
 
             try:
                 geocache_file.write_text(json.dumps(cache, ensure_ascii=False, indent=2))
             except OSError as e:
-                print(f"Warning: could not save geocache: {e}", file=sys.stderr)
+                log.warning("could not save geocache: %s", e)
 
-    # Apply cache to media files
     for m in media_files:
         if m.lat is not None and m.lon is not None:
             key = f"{round(m.lat, 2)},{round(m.lon, 2)}"
@@ -256,6 +261,7 @@ def geocode_all(media_files: list[MediaFile], geocache_file: Path, skip: bool) -
 
 
 def format_date(dt: datetime | None) -> str:
+    """Format a datetime as a Norwegian date string, e.g. '1. januar 2024'."""
     if dt is None:
         return ""
     months = [
@@ -271,7 +277,7 @@ HTML_TEMPLATE = """\
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Lars Frederick</title>
+<title>Slideshow</title>
 <style>
 * { box-sizing: border-box; }
 html, body {
@@ -507,20 +513,22 @@ def render_html(
     seed: int | None,
     output_path: Path,
 ) -> None:
+    """Shuffle media files and write slideshow.html + slideshow_data.js to output_path's directory."""
     shuffled = list(media_files)
     random.seed(seed)
     random.shuffle(shuffled)
 
-    slides = []
-    for m in shuffled:
-        slides.append({
+    slides = [
+        {
             "src": m.display_path,
             "kind": m.kind,
             "date": format_date(m.date),
             "location": m.location or "",
             "rotation": m.rotation,
             "duration": m.duration,
-        })
+        }
+        for m in shuffled
+    ]
 
     data_path = output_path.parent / "slideshow_data.js"
     slides_json = json.dumps(slides, ensure_ascii=False, indent=2)
@@ -532,41 +540,47 @@ def render_html(
     output_path.write_text(HTML_TEMPLATE, encoding="utf-8")
 
 
-def main():
+def main() -> None:
+    """Entry point: parse args, process media, and generate the slideshow."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     args = parse_args()
 
     album_dir = args.album_dir.resolve()
     if not album_dir.is_dir():
-        print(f"Error: album directory not found: {album_dir}", file=sys.stderr)
+        log.error("album directory not found: %s", album_dir)
         sys.exit(1)
 
     output_path = args.output.resolve()
     converted_dir = album_dir / "converted"
 
-    print(f"Scanning {album_dir}...")
+    log.info("Scanning %s...", album_dir)
     paths = scan_files(album_dir)
-    print(f"Found {len(paths)} files ({sum(1 for p in paths if p.suffix in IMAGE_EXTS)} images, "
-          f"{sum(1 for p in paths if p.suffix in VIDEO_EXTS)} videos)")
+    log.info(
+        "Found %d files (%d images, %d videos)",
+        len(paths),
+        sum(1 for p in paths if p.suffix in IMAGE_EXTS),
+        sum(1 for p in paths if p.suffix in VIDEO_EXTS),
+    )
 
-    print("Extracting EXIF data...")
+    log.info("Extracting EXIF data...")
     exif_data = extract_exif(paths)
 
     media_files = build_media_files(paths, exif_data, output_path)
 
-    print("Converting HEIC files...")
-    convert_heic_files(media_files, converted_dir, args.force_reconvert)
+    log.info("Converting HEIC files...")
+    convert_heic_files(media_files, converted_dir, force=args.force_reconvert)
 
-    geocode_all(media_files, args.geocache_file.resolve(), args.skip_geocoding)
+    geocode_all(media_files, args.geocache_file.resolve(), skip=args.skip_geocoding)
 
     with_date = sum(1 for m in media_files if m.date)
     with_loc = sum(1 for m in media_files if m.location)
-    print(f"Dates found: {with_date}/{len(media_files)}, Locations found: {with_loc}/{len(media_files)}")
+    log.info("Dates found: %d/%d, Locations found: %d/%d", with_date, len(media_files), with_loc, len(media_files))
 
-    print(f"Rendering HTML → {output_path}")
+    log.info("Rendering HTML -> %s", output_path)
     render_html(media_files, args.slide_duration, args.seed, output_path)
 
-    print("\nDone! Open with:")
-    print(f"  open {output_path}")
+    log.info("\nDone! Open with:\n  open %s", output_path)
 
 
 if __name__ == "__main__":

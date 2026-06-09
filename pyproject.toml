@@ -18,7 +18,14 @@ dev = [
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "UP", "B"]
+select = ["ALL"]
+ignore = [
+    "S603",   # subprocess call with untrusted input, commands are hardcoded
+    "S310",   # urllib open, URL is hardcoded (Nominatim)
+    "S607",   # partial executable path, exiftool/sips are system tools
+    "DTZ001", # naive datetime, EXIF dates have no timezone by definition
+    "DTZ007", # naive datetime strptime (same reason)
+]
 
 [tool.pylint.master]
 ignore = ".venv"
